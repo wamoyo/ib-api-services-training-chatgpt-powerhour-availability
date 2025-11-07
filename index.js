@@ -1,164 +1,173 @@
 
 /*
  * Route: api.innovationbound.com/services/training/chatgpt/powerhour/availability
- * Check Costa's availability via Google Calendar and send back busy times
- * Reads email, creates db entry, sends confirmation email, responds {event.body.confirmation}
+ * Check Costa's availability via Google Calendar OAuth 2.0
+ * Returns array of available 1-hour time slots for next 14 days
  */
 
-import { readFile } from 'fs/promises'
-import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses'
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb'
+import { google } from 'googleapis'
 
-var ses = new SESClient({ region: 'us-east-1' })
-var dynamoDb = new DynamoDBClient({ region: 'us-east-1' })
-var db = DynamoDBDocumentClient.from(dynamoDb)
-var replyToAddress = "Innovation Bound <support@innovationbound.com>"
+// Costa's calendars to check (1 primary Google + 3 imported Proton calendars)
+var calendarIds = [
+  'costa@innovationbound.com',
+  'akt089rchsj5ac6cosplsrgr8u6atk3n@import.calendar.google.com',  // CarbonNanotubes.org
+  'd3mlc29pl22cudsoek10r8vv6mc6itvj@import.calendar.google.com',  // SpaceElevatorCompany.com
+  'lj5e3vj57tbngl38um6g50u8t7sa2jp6@import.calendar.google.com'   // TrollHair.com
+]
 
 export async function handler (event) {
   console.log('EVENT:', JSON.stringify(event))
   if (event.httpMethod === 'OPTIONS') return respond(204) // For OPTIONS preflight
+
   try {
-    // Event is already parsed JSON from API Gateway
-    var json = event.body ? JSON.parse(event.body) : event
-    var name = json.application.name ?? null
-    var email = json.application.email?.toLowerCase() ?? null
-    var website = json.application.website ?? null
-    var linkedin = json.application.linkedin ?? null
-    var assistance = json.application.assistance ?? null
-    var referrerName = json.application.referrerName ?? null
-    var referrerEmail = json.application.referrerEmail?.toLowerCase() ?? null
-    var techLevel = json.application.techLevel ?? null
+    console.log('Fetching availability from Google Calendar...')
 
-    // Validate incoming data
-    console.log(`Validating application info for ${email || '(no email provided)'}.`)
+    // Get OAuth credentials from environment variables
+    var refreshToken = process.env.GOOGLE_CAL_OAUTH_REFRESH_TOKEN
+    var clientId = process.env.GOOGLE_CAL_OAUTH_CLIENT_ID
+    var clientSecret = process.env.GOOGLE_CAL_OAUTH_CLIENT_SECRET
 
-    if (!name) return respond(400, {error: 'Name is required.'})
-    if (!email) return respond(400, {error: 'Email is required.'})
-    if (email.match(/@/) == null) return respond(400, {error: 'Please provide a valid email.'})
-    if (!website) return respond(400, {error: 'Company Website is required.'})
-    if (!linkedin) return respond(400, {error: 'LinkedIn Profile is required.'})
-    if (assistance === null || assistance === undefined) return respond(400, {error: 'Assistance is required.'})
-    if (![0, 25, 50, 75].includes(Number(assistance))) return respond(400, {error: 'Assistance must be 0, 25, 50, or 75.'})
-    if (techLevel !== null && techLevel !== '' && !['beginner', 'intermediate', 'advanced'].includes(techLevel)) return respond(400, {error: 'Tech level must be beginner, intermediate, or advanced.'})
-    if (name.length > 2000) return respond(400, {error: 'Name must be 2000 characters or less.'})
-    if (email.length > 2000) return respond(400, {error: 'Email must be 2000 characters or less.'})
-    if (website.length > 2000) return respond(400, {error: 'Company Website must be 2000 characters or less.'})
-    if (linkedin.length > 2000) return respond(400, {error: 'LinkedIn Profile must be 2000 characters or less.'})
-
-    // Check if the company already has an application in
-    var applicant = await db.send(new GetCommand({
-      TableName: "www.innovationbound.com",
-      Key: { pk: `application#ai-accelerator`, sk: email }
-    }))
-
-    if (applicant.Item) {
-      return respond(400, {error: 'You have already applied to the 2026 AI Accelerator.'})
+    if (!refreshToken || !clientId || !clientSecret) {
+      throw new Error('Missing OAuth environment variables')
     }
 
-    // Email data
-    console.log(`Sending confirmation email to ${email}.`)
+    // Create OAuth2 client
+    var oauth2Client = new google.auth.OAuth2(clientId, clientSecret)
+    oauth2Client.setCredentials({ refresh_token: refreshToken })
 
-    var rawHtml = await readFile("apply-confirmation.html", "utf8")
-    var rawTxt = await readFile("apply-confirmation.txt", "utf8")
+    var calendar = google.calendar({ version: 'v3', auth: oauth2Client })
 
-    // Calculate assistance amount
-    var assistanceAmounts = {
-      '0': '$0',
-      '25': '$7,500',
-      '50': '$15,000',
-      '75': '$22,500'
-    }
-    var assistanceAmount = assistanceAmounts[assistance] || '$0'
+    // Calculate time range (next 60 days)
+    var now = new Date()
+    var timeMin = now.toISOString()
+    var timeMax = new Date(now.getTime() + (60 * 24 * 60 * 60 * 1000)).toISOString()
 
-    // Format tech level for email
-    var techLevelDisplay = techLevel && techLevel !== '' ? techLevel.charAt(0).toUpperCase() + techLevel.slice(1) : 'Not Specified'
+    console.log(`Querying FreeBusy from ${timeMin} to ${timeMax}`)
 
-    // Build referrer info for email
-    var referrerInfoHtml = ''
-    var referrerInfoTxt = ''
-    if (referrerName && referrerEmail) {
-      referrerInfoHtml = `\n        <li><strong>Referred by:</strong> ${referrerName} (${referrerEmail})</li>`
-      referrerInfoTxt = `\n- Referred by: ${referrerName} (${referrerEmail})`
-    }
+    // Query FreeBusy for all calendars
+    var freeBusyResponse = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: timeMin,
+        timeMax: timeMax,
+        items: calendarIds.map(function (id) { return { id: id } })
+      }
+    })
 
-    // Replace template variables
-    var html = rawHtml
-      .replace(/{{tracking}}/g, `email=${email}&list=ai-accelerator-applications&edition=apply-confirmation`)
-      .replace(/{{emailSettings}}/g, `https://www.innovationbound.com/unsubscribe?email=${email}`)
-      .replace(/{{name}}/g, name)
-      .replace(/{{email}}/g, email)
-      .replace(/{{website}}/g, website)
-      .replace(/{{linkedin}}/g, linkedin)
-      .replace(/{{techLevel}}/g, techLevelDisplay)
-      .replace(/{{assistancePercent}}/g, assistance)
-      .replace(/{{assistanceAmount}}/g, assistanceAmount)
-      .replace(/{{referrerInfo}}/g, referrerInfoHtml)
+    console.log('FreeBusy response:', JSON.stringify(freeBusyResponse.data, null, 2))
 
-    var txt = rawTxt
-      .replace(/{{tracking}}/g, `email=${email}&list=ai-accelerator-applications&edition=apply-confirmation`)
-      .replace(/{{emailSettings}}/g, `https://www.innovationbound.com/unsubscribe?email=${email}`)
-      .replace(/{{name}}/g, name)
-      .replace(/{{email}}/g, email)
-      .replace(/{{website}}/g, website)
-      .replace(/{{linkedin}}/g, linkedin)
-      .replace(/{{techLevel}}/g, techLevelDisplay)
-      .replace(/{{assistancePercent}}/g, assistance)
-      .replace(/{{assistanceAmount}}/g, assistanceAmount)
-      .replace(/{{referrerInfo}}/g, referrerInfoTxt)
+    // Merge all busy times from all calendars
+    var allBusyTimes = []
+    Object.keys(freeBusyResponse.data.calendars).forEach(function (calId) {
+      var calendarData = freeBusyResponse.data.calendars[calId]
+      if (calendarData.busy) {
+        allBusyTimes = allBusyTimes.concat(calendarData.busy)
+      }
+    })
 
-    var confirm = await ses.send(new SendEmailCommand({
-      Destination: {
-        ToAddresses: [email],
-        BccAddresses: [replyToAddress]
-      },
-      Message: {
-        Body: {
-          Html: { Charset: "UTF-8", Data: html },
-          Text: { Charset: "UTF-8", Data: txt }
-        },
-        Subject: { Charset: "UTF-8", Data: `📋 Application Confirmed for Innovation Bound's 2026 AI Accelerator - We'll respond within 3 days` }
-      },
-      ReplyToAddresses: [replyToAddress],
-      Source: replyToAddress
-    }))
+    console.log(`Found ${allBusyTimes.length} busy blocks across all calendars`)
 
+    // Calculate available slots
+    var availableSlots = calculateAvailableSlots(now, 60, allBusyTimes)
 
-    // Store list application
-    var applicationItem = {
-      pk: `application#ai-accelerator`,
-      sk: email,
-      name: name,
-      email: email,
-      website: website,
-      linkedin: linkedin,
-      assistance: assistance,
-      applied: new Date().toJSON()
-    }
+    console.log(`Calculated ${availableSlots.length} available slots`)
 
-    // Add referrer data if present
-    if (referrerName && referrerEmail) {
-      applicationItem.referrerName = referrerName
-      applicationItem.referrerEmail = referrerEmail
-    }
+    return respond(200, { available: availableSlots })
 
-    // Add techLevel if present
-    if (techLevel && techLevel !== '') {
-      applicationItem.techLevel = techLevel
-    }
-
-    var applied = await db.send(new PutCommand({
-      TableName: "www.innovationbound.com",
-      Item: applicationItem
-    }))
-
-
-    // Respond
-    return respond(200, {message: `Application confirmed for ${name}, ${email}.`})
   } catch (error) {
-    console.log(error)
-    return respond(500, {error: `500 - Something went wrong with ${email || '(no email provided)'}'s application for the 2026 AI Accelerator.`})
+    console.error('Error fetching availability:', error)
+    return respond(500, { error: 'Failed to fetch availability' })
   }
+}
+
+// Pure: Calculate available 1-hour slots
+// Rules:
+// - 9am-4pm ET (business hours, last slot starts at 4pm and ends at 5pm)
+// - Weekdays only (Mon-Fri)
+// - Top of hour only (9:00, 10:00, 11:00, etc.)
+// - At least 4 hours from now
+// - 30-minute buffer before/after existing bookings
+function calculateAvailableSlots (startDate, daysToCheck, busyTimes) {
+  var availableSlots = []
+  var minimumAdvanceMs = 4 * 60 * 60 * 1000 // 4 hours
+  var bufferMs = 30 * 60 * 1000 // 30 minutes
+  var sessionMs = 60 * 60 * 1000 // 1 hour
+
+  // Convert busy times to Date objects with buffers
+  var busyRanges = busyTimes.map(function (busy) {
+    return {
+      start: new Date(new Date(busy.start).getTime() - bufferMs),
+      end: new Date(new Date(busy.end).getTime() + bufferMs)
+    }
+  })
+
+  // Check each day
+  for (var day = 0; day < daysToCheck; day++) {
+    // Get the date for this day
+    var checkDate = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate() + day)
+
+    // Skip weekends (0 = Sunday, 6 = Saturday)
+    if (checkDate.getDay() === 0 || checkDate.getDay() === 6) continue
+
+    // Determine UTC offset for Eastern Time on this date
+    // EST = UTC-5, EDT = UTC-4
+    var isDST = isEDT(checkDate)
+    var utcOffsetHours = isDST ? 4 : 5
+
+    // Check each hour from 9am to 4pm EASTERN TIME
+    // (last slot starts at 4pm ET and ends at 5pm ET)
+    for (var etHour = 9; etHour <= 16; etHour++) {
+      // Create UTC timestamp for this ET hour
+      // To convert ET to UTC: add the offset
+      // Example: 9am EST (UTC-5) = 9 + 5 = 14:00 UTC
+      var slotStart = new Date(Date.UTC(
+        checkDate.getFullYear(),
+        checkDate.getMonth(),
+        checkDate.getDate(),
+        etHour + utcOffsetHours,  // Convert ET hour to UTC hour
+        0, 0, 0
+      ))
+
+      var slotEnd = new Date(slotStart.getTime() + sessionMs)
+
+      // Skip if less than minimum advance time
+      if (slotStart.getTime() < (startDate.getTime() + minimumAdvanceMs)) continue
+
+      // Check if slot conflicts with any busy time (including buffer)
+      var isAvailable = true
+      for (var i = 0; i < busyRanges.length; i++) {
+        var busy = busyRanges[i]
+        // Check for overlap: slot starts before busy ends AND slot ends after busy starts
+        if (slotStart < busy.end && slotEnd > busy.start) {
+          isAvailable = false
+          break
+        }
+      }
+
+      if (isAvailable) {
+        availableSlots.push(slotStart.toISOString())
+      }
+    }
+  }
+
+  return availableSlots
+}
+
+// Pure: Check if date is in Eastern Daylight Time (EDT) vs Eastern Standard Time (EST)
+// EDT: Second Sunday in March to first Sunday in November
+function isEDT (date) {
+  var year = date.getFullYear()
+
+  // Find second Sunday in March
+  var march = new Date(year, 2, 1) // March 1
+  var marchDay = march.getDay()
+  var secondSundayMarch = new Date(year, 2, (14 - marchDay) % 7 + 8, 2, 0, 0) // 2am
+
+  // Find first Sunday in November
+  var november = new Date(year, 10, 1) // November 1
+  var novemberDay = november.getDay()
+  var firstSundayNovember = new Date(year, 10, (7 - novemberDay) % 7 + 1, 2, 0, 0) // 2am
+
+  return date >= secondSundayMarch && date < firstSundayNovember
 }
 
 function respond (code, message) {
@@ -167,7 +176,7 @@ function respond (code, message) {
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin' : 'https://www.innovationbound.com',
-      'Access-Control-Allow-Methods' : 'POST,OPTIONS',
+      'Access-Control-Allow-Methods' : 'GET,OPTIONS',
       'Access-Control-Allow-Headers' : 'Accept, Content-Type, Authorization',
       'Access-Control-Allow-Credentials' : true
     },
@@ -175,4 +184,3 @@ function respond (code, message) {
     statusCode: code
   }
 }
-
